@@ -1,0 +1,24 @@
+{
+  "name": "dsh-model-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Route selected models through an outbound proxy in DeepSeek Harness, falling back to a direct connection while that proxy is unavailable.",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "undici": "~8.10.0"
+  }
+}

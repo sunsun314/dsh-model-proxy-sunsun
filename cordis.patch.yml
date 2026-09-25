@@ -1,0 +1,24 @@
+# dsh-model-proxy bundle patch: inserts the routing row.
+#
+# The values below are a starting point, not a recommendation: point `proxy` at
+# your own endpoint and set `origins`/`models` to whatever you need routed. A
+# configuration with no matching request is inert, and `fallbackToDirect` keeps
+# a stopped proxy from failing calls that would otherwise go direct.
+#
+# `models` is matched against the request body's `model` field; every other
+# request in the process keeps the route it already had.
+- insert:
+    - id: model-proxy
+      name: 'dsh-model-proxy'
+      config:
+        enabled: true
+        proxy: http://127.0.0.1:7890
+        origins:
+          - opencode.ai
+        models:
+          - grok-*
+          - gpt-*-luna
+        fallbackToDirect: true
+        probeTimeoutMs: 300
+        probeCacheMs: 2000
+        peekBytes: 16384
