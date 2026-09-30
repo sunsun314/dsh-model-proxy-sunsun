@@ -13,6 +13,7 @@
     "cordis.patch.yml"
   ],
   "license": "MIT",
+  "author": "windwhiterain",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
