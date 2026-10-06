@@ -8,8 +8,8 @@
  * (`Symbol.for('undici.globalDispatcher.1')`). This plugin owns that slot and
  * forwards each request to one of two routes:
  *
- * - a request whose JSON body names a model matching `models` goes through
- *   `proxy`;
+ * - a request whose URL path or JSON body names a model matching `models` goes
+ *   through `proxy`;
  * - every other request keeps the route that was installed before this plugin
  *   loaded, so a deployment without proxy environment variables stays direct.
  *
@@ -176,6 +176,27 @@ function modelFromText(text) {
 }
 
 /**
+ * Name the model a request path asks for.
+ *
+ * The native Google APIs name their model in the path and leave it out of the
+ * JSON body entirely, so a body-only matcher never sees it: Google Generative AI
+ * posts to `/v1beta/models/<model>:streamGenerateContent`, and Vertex to
+ * `/v1/projects/<project>/locations/<location>/publishers/google/models/<model>:generateContent`.
+ * Both spellings, plus `tunedModels/<model>`, are read here.
+ *
+ * A collection path such as `/v1beta/models?pageSize=10` names no model: the
+ * `models` segment has to be followed by a separator and a name.
+ * @param path - the request path from the undici dispatch options, query included.
+ * @returns the model identifier, or undefined when the path names none.
+ */
+export function modelFromPath(path) {
+  if (typeof path !== 'string') return undefined
+  // The length bound keeps a pathological segment from being offered as a model.
+  const match = /\/(?:tunedModels|models)\/([^/:?]{1,200})/.exec(path)
+  return match?.[1]
+}
+
+/**
  * Read the head of a request body far enough to name its model, then hand the
  * whole body on unchanged.
  *
@@ -290,15 +311,22 @@ function createRoutingDispatcher(options) {
           if (!listening) {
             reason = 'proxy-down'
           } else {
-            const peeked = await peekModel(dispatchOptions.body, options.config.peekBytes)
-            dispatchOptions.body = peeked.body
-            if (peeked.model === undefined) {
+            // The path is checked first because a request that names its model
+            // there is routed without its body being held at all; only a request
+            // that names none falls back to reading the body's head.
+            let model = modelFromPath(dispatchOptions.path)
+            if (model === undefined) {
+              const peeked = await peekModel(dispatchOptions.body, options.config.peekBytes)
+              dispatchOptions.body = peeked.body
+              model = peeked.model
+            }
+            if (model === undefined) {
               reason = 'no-model'
-            } else if (options.config.modelMatchers.some(matches => matches(peeked.model))) {
+            } else if (options.config.modelMatchers.some(matches => matches(model))) {
               target = options.proxied
-              reason = `model:${peeked.model}`
+              reason = `model:${model}`
             } else {
-              reason = `model-other:${peeked.model}`
+              reason = `model-other:${model}`
             }
           }
         }

@@ -5,8 +5,10 @@
 # configuration with no matching request is inert, and `fallbackToDirect` keeps
 # a stopped proxy from failing calls that would otherwise go direct.
 #
-# `models` is matched against the request body's `model` field; every other
-# request in the process keeps the route it already had.
+# `models` is matched against the model a request names, read from its URL path
+# (`/v1beta/models/<model>:generateContent`, the native Google shape) and then
+# from its body's `model` field (`/chat/completions`, the OpenAI-compatible
+# shape); every other request in the process keeps the route it already had.
 - insert:
     - id: model-proxy
       name: 'dsh-model-proxy'
@@ -15,9 +17,11 @@
         proxy: http://127.0.0.1:7890
         origins:
           - opencode.ai
+          - generativelanguage.googleapis.com
         models:
           - grok-*
           - gpt-*-luna
+          - gemini-*
         fallbackToDirect: true
         probeTimeoutMs: 300
         probeCacheMs: 2000

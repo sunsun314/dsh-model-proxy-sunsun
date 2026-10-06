@@ -30,13 +30,16 @@ decides in this order:
    `host:port` refuses a TCP connection, candidate requests keep that previous
    route too. A stopped proxy then costs you the proxied models and nothing
    else, instead of failing every call.
-3. **Model name** — the head of the request body is read for its `"model"`
-   field, and the request goes through `proxy` when that name matches one of
-   `models`.
+3. **Model name** — the request path is read for a `/models/<model>` or
+   `/tunedModels/<model>` segment, and the request goes through `proxy` when that
+   name matches one of `models`. A request whose path names no model falls back to
+   the head of its body, which is where OpenAI-compatible gateways put the name
+   in a `"model"` field.
 
-Only the first chunks of the body are held, and the held chunks are yielded
-before the rest of the stream, so chunk boundaries, backpressure, and streaming
-responses are unchanged.
+A request matched on its path never has its body touched. For the body fallback,
+only the first chunks are held, and the held chunks are yielded before the rest of
+the stream, so chunk boundaries, backpressure, and streaming responses are
+unchanged.
 
 `direct` means *the route the process already had*. With no proxy in the launch
 environment that is a direct connection, so an unconfigured deployment behaves
@@ -93,7 +96,7 @@ plugin be the only thing that proxies anything.
 | `enabled` | When false the plugin installs nothing and every request keeps its route. |
 | `proxy` | Endpoint the matching models use. `http:` or `https:`, with optional credentials. |
 | `origins` | Hosts whose models may be routed. Requests to every other host are untouched. |
-| `models` | Model patterns; `*` matches any run of characters, every other character matches itself. |
+| `models` | Model patterns; `*` matches any run of characters, every other character matches itself. Each request's model is read from its path first, then from its body. |
 | `fallbackToDirect` | While the proxy refuses connections, matching requests use the previous route instead of failing. |
 | `probeTimeoutMs` | TCP connect timeout for the reachability probe. |
 | `probeCacheMs` | How long one probe verdict is reused, so a burst of requests probes once. |
@@ -128,6 +131,25 @@ plugin.
     models: ['*']
 ```
 
+**A region-blocked Gemini endpoint.** `generativelanguage.googleapis.com` is
+unreachable from some networks while a proxy in a supported region answers
+normally. The native Google API names its model in the URL path
+(`/v1beta/models/gemini-3.6-flash:streamGenerateContent`) and not in the body, so
+the path is what carries the match — no gateway config beyond the origin and the
+model family is needed:
+
+```yaml
+- id: model-proxy
+  config:
+    proxy: http://127.0.0.1:7890
+    origins: [generativelanguage.googleapis.com]
+    models: ['gemini-*']
+```
+
+Both spellings coexist in one row, so a deployment that already routes OpenCode's
+region-restricted families can add Google to the same `origins`/`models` lists and
+leave everything else direct.
+
 **A whole gateway through a different egress, with the rest of the process
 untouched.** Same as the corporate case with `models: ['*']` — the routing is
 still per request, so a host you later add elsewhere is unaffected.
@@ -139,6 +161,7 @@ Each decision is logged through the host logger:
 ```
 dsh-model-proxy: models grok-*, gpt-*-luna on opencode.ai via http://127.0.0.1:10793, direct while it is down
 dsh-model-proxy: route=proxy via=http://127.0.0.1:10793 reason=model:grok-4.7
+dsh-model-proxy: route=proxy via=http://127.0.0.1:10793 reason=model:gemini-3.6-flash
 dsh-model-proxy: route=direct via=direct reason=model-other:glm-5.3-flash
 dsh-model-proxy: route=direct via=direct reason=proxy-down
 dsh-model-proxy: route=direct via=direct reason=origin
@@ -150,13 +173,24 @@ still claim the slot.
 ## Probe
 
 ```sh
+node probe/routing.mjs            # model-name readers, offline
+node probe/gemini.mjs             # native Google API through the proxy
 node probe/smoke.mjs              # proxy reachable
 node probe/smoke.mjs --proxy-down # fallback
 ```
 
-The probe boots the plugin against a stub context and drives real requests
-through the installed dispatcher, asserting both the chosen route and the
-integrity of the response body. It reads the API key from the DSH credential
+`probe/routing.mjs` exercises the path and body readers directly. It needs no
+network, no proxy, and no credential, so it runs anywhere.
+
+`probe/gemini.mjs` covers the native Google API end to end: it asserts that a
+path-named model is proxied, that a path-named model outside `models` stays
+direct, and that the body reader still matches. It takes
+`--proxy=<url>` (default `http://127.0.0.1:7890`) and `--model=<id>`, and reads
+`GOOGLE_API_KEY` from the DSH credential store.
+
+`probe/smoke.mjs` boots the plugin against a stub context and drives real
+requests through the installed dispatcher, asserting both the chosen route and
+the integrity of the response body. It reads the API key from the DSH credential
 store, so point the config at credentials you hold before running it.
 `node probe/decode-matrix.mjs <baseline|agent8|proxy8|wrapper8>` isolates the
 undici hazard described below from the routing logic.
@@ -180,9 +214,9 @@ undici hazard described below from the routing logic.
 - **In-process calls only.** The decision lives inside the dsh process, so a
   `curl` or `git` started by a shell tool does not follow it. Those follow the
   launch environment, which this plugin deliberately leaves alone.
-- **The model is read from the body.** A request that names its model only in a
-  header, or whose body exceeds `peekBytes` before the `model` field, is not
-  matched and keeps the direct route.
+- **The model is read from the path or the body.** A request that names its model
+  only in a header, or whose body exceeds `peekBytes` before the `model` field, is
+  not matched and keeps the direct route.
 - **A reachable proxy that fails upstream is not detected.** The probe answers
   "is something listening", not "does the proxy work"; that request fails.
 - **One proxy per row.** Routing different model families to different proxies
