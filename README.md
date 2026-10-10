@@ -35,6 +35,12 @@ decides in this order:
    name matches one of `models`. A request whose path names no model falls back to
    the head of its body, which is where OpenAI-compatible gateways put the name
    in a `"model"` field.
+4. **Pacing** — a proxied request waits for a slot in its rate-limit bucket before
+   it is dispatched, so a paced upstream is never asked for more than
+   `rateLimit.requestsPerSecond`. The wait is invisible to the caller apart from
+   taking longer; a request that would wait past `rateLimit.maxWaitMs` fails
+   instead of being sent, and **never** falls back to the direct route, which is
+   the traffic the limit exists to hold back.
 
 A request matched on its path never has its body touched. For the body fallback,
 only the first chunks are held, and the held chunks are yielded before the rest of
@@ -89,6 +95,13 @@ plugin be the only thing that proxies anything.
     probeTimeoutMs: 300
     probeCacheMs: 2000
     peekBytes: 16384
+    rateLimit:
+      enabled: false
+      requestsPerSecond: 1
+      burst: 1
+      scope: model
+      models: []
+      maxWaitMs: 120000
 ```
 
 | Field | Meaning |
@@ -101,6 +114,12 @@ plugin be the only thing that proxies anything.
 | `probeTimeoutMs` | TCP connect timeout for the reachability probe. |
 | `probeCacheMs` | How long one probe verdict is reused, so a burst of requests probes once. |
 | `peekBytes` | How many body bytes may be inspected before giving up on finding a model name. |
+| `rateLimit.enabled` | When false nothing is paced and no request waits. |
+| `rateLimit.requestsPerSecond` | Sustained requests per second let through, per bucket. Fractional values are allowed, so `0.2` is one request every five seconds. |
+| `rateLimit.burst` | How many requests may start together after an idle period. |
+| `rateLimit.scope` | `model` gives every model its own bucket; `shared` puts them all in one. |
+| `rateLimit.models` | Which proxied models are paced; `*` patterns, and an empty list paces every proxied model. |
+| `rateLimit.maxWaitMs` | Longest a request may wait for its slot. `0` never waits: an occupied bucket refuses the request outright. |
 
 Edit the row in `<DSH_HOME>/profiles/<profile>/cordis.patch.yml` (hot-reloaded),
 or override the same `id` from a settings layer. A configuration value that
@@ -150,6 +169,36 @@ Both spellings coexist in one row, so a deployment that already routes OpenCode'
 region-restricted families can add Google to the same `origins`/`models` lists and
 leave everything else direct.
 
+**Pacing a free tier that meters per model.** Google's free tier counts each
+model separately and rejects a burst with `429 RESOURCE_EXHAUSTED`, which the
+provider SDK reports unhelpfully. Handing the pacing to the plugin keeps those
+requests succeeding instead of failing:
+
+```yaml
+- id: model-proxy
+  config:
+    proxy: http://127.0.0.1:7890
+    origins: [generativelanguage.googleapis.com]
+    models: ['gemini-*']
+    rateLimit:
+      enabled: true
+      requestsPerSecond: 1
+      burst: 1
+      models: ['gemini-*']
+      maxWaitMs: 120000
+```
+
+`models` inside `rateLimit` is worth setting whenever one row covers several
+upstreams: it keeps the pacing on the meters that have a ceiling and off the ones
+that do not. Under the default `model` scope each paced model gets its own
+bucket, matching a per-model quota; `scope: shared` spends one allowance across
+every paced model instead.
+
+A request that cannot get a slot before `maxWaitMs` fails with
+`RateLimitExceededError` rather than being sent. Whatever you do, do not soften
+that into a direct fallback: the direct route is the very traffic the limit is
+there to hold back.
+
 **A whole gateway through a different egress, with the rest of the process
 untouched.** Same as the corporate case with `models: ['*']` — the routing is
 still per request, so a host you later add elsewhere is unaffected.
@@ -159,13 +208,21 @@ still per request, so a host you later add elsewhere is unaffected.
 Each decision is logged through the host logger:
 
 ```
-dsh-model-proxy: models grok-*, gpt-*-luna on opencode.ai via http://127.0.0.1:10793, direct while it is down
+dsh-model-proxy: models grok-*, gpt-*-luna on opencode.ai via http://127.0.0.1:10793, direct while it is down, paced at 1/s (burst 1, model scope, refusing past 120000ms) on gemini-*
 dsh-model-proxy: route=proxy via=http://127.0.0.1:10793 reason=model:grok-4.7
 dsh-model-proxy: route=proxy via=http://127.0.0.1:10793 reason=model:gemini-3.6-flash
+dsh-model-proxy: route=proxy via=http://127.0.0.1:10793 reason=model:gemini-3.6-flash waited=1004ms
 dsh-model-proxy: route=direct via=direct reason=model-other:glm-5.3-flash
 dsh-model-proxy: route=direct via=direct reason=proxy-down
 dsh-model-proxy: route=direct via=direct reason=origin
+dsh-model-proxy: refused a request for gemini-3.6-flash: dsh-model-proxy: rate limit for gemini-3.6-flash would wait past 120000ms (already waited 0ms); the request was not sent
 ```
+
+A request that spent no time waiting carries no `waited=` note, so a paced route
+is visible in the log as the difference between two otherwise identical lines.
+The refusal is a `warn`, because it is the one outcome the caller cannot see
+coming: its `fetch` rejects with a `TypeError: fetch failed` whose `cause` is the
+`RateLimitExceededError`.
 
 On unload the plugin restores the dispatcher it displaced, so a later plugin can
 still claim the slot.
@@ -174,6 +231,7 @@ still claim the slot.
 
 ```sh
 node probe/routing.mjs            # model-name readers, offline
+node probe/rate-limit.mjs         # the pacing limiter, offline
 node probe/gemini.mjs             # native Google API through the proxy
 node probe/smoke.mjs              # proxy reachable
 node probe/smoke.mjs --proxy-down # fallback
@@ -181,6 +239,10 @@ node probe/smoke.mjs --proxy-down # fallback
 
 `probe/routing.mjs` exercises the path and body readers directly. It needs no
 network, no proxy, and no credential, so it runs anywhere.
+
+`probe/rate-limit.mjs` covers the pacing limiter the same way: sustained rate,
+burst, per-model and shared scope, and the refusal that must not wedge the queue
+behind it. It is also offline, and takes about a second.
 
 `probe/gemini.mjs` covers the native Google API end to end: it asserts that a
 path-named model is proxied, that a path-named model outside `models` stays
@@ -221,6 +283,12 @@ undici hazard described below from the routing logic.
   "is something listening", not "does the proxy work"; that request fails.
 - **One proxy per row.** Routing different model families to different proxies
   needs more than one row, which the current implementation does not support.
+- **One limiter per process.** Buckets live beside the routing decision, so two
+  dsh processes sharing one API key each get their own full allowance. The meter
+  is on the process, not on the account.
+- **Pacing counts requests, not cost.** A bucket spends one slot per dispatched
+  request, however large that request is, because that is what the upstreams that
+  publish a requests-per-second figure meter.
 
 ## License
 

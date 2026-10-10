@@ -17,6 +17,13 @@
  * while the proxy's host:port refuses connections, matching requests use the
  * pre-existing route too.
  *
+ * `rateLimit` paces the proxied requests, so an upstream that allows only a few
+ * requests per second is never asked for more than that. The wait happens before
+ * the request is dispatched, so a caller sees a slower response rather than a
+ * rejection; a request that would wait past `maxWaitMs` fails instead of being
+ * sent, and never falls back to the direct route, which is the very traffic the
+ * limit exists to hold back.
+ *
  * @module dsh-model-proxy
  */
 
@@ -35,6 +42,14 @@ const DEFAULT_CONFIG = {
   probeTimeoutMs: 300,
   probeCacheMs: 2000,
   peekBytes: 16384,
+  rateLimit: {
+    enabled: false,
+    requestsPerSecond: 1,
+    burst: 1,
+    scope: 'model',
+    models: [],
+    maxWaitMs: 120000,
+  },
 }
 
 /**
@@ -80,6 +95,45 @@ function resolveConfig(raw) {
     probeTimeoutMs: config.probeTimeoutMs,
     probeCacheMs: config.probeCacheMs,
     peekBytes: config.peekBytes,
+    rateLimit: resolveRateLimit(config.rateLimit),
+  }
+}
+
+/**
+ * Validate the `rateLimit` block.
+ *
+ * The block resolves even when pacing is off, so the dispatcher can ask one place
+ * whether a matched model is paced.
+ * @param raw - the row's `config.rateLimit`, or undefined.
+ * @returns the resolved block, with the paced-model patterns compiled.
+ * @throws {TypeError} when a supplied field has the wrong type or an unusable value.
+ */
+function resolveRateLimit(raw) {
+  const rateLimit = { ...DEFAULT_CONFIG.rateLimit, ...(raw ?? {}) }
+  if (typeof rateLimit.enabled !== 'boolean') {
+    throw new TypeError(`dsh-model-proxy: config.rateLimit.enabled must be a boolean, got ${JSON.stringify(rateLimit.enabled)}`)
+  }
+  if (typeof rateLimit.requestsPerSecond !== 'number' || !Number.isFinite(rateLimit.requestsPerSecond) || rateLimit.requestsPerSecond <= 0) {
+    throw new TypeError(`dsh-model-proxy: config.rateLimit.requestsPerSecond must be a positive finite number, got ${JSON.stringify(rateLimit.requestsPerSecond)}`)
+  }
+  if (!Number.isSafeInteger(rateLimit.burst) || rateLimit.burst <= 0) {
+    throw new TypeError(`dsh-model-proxy: config.rateLimit.burst must be a positive safe integer, got ${JSON.stringify(rateLimit.burst)}`)
+  }
+  if (rateLimit.scope !== 'model' && rateLimit.scope !== 'shared') {
+    throw new TypeError(`dsh-model-proxy: config.rateLimit.scope must be "model" or "shared", got ${JSON.stringify(rateLimit.scope)}`)
+  }
+  if (!Number.isSafeInteger(rateLimit.maxWaitMs) || rateLimit.maxWaitMs < 0) {
+    throw new TypeError(`dsh-model-proxy: config.rateLimit.maxWaitMs must be a non-negative safe integer, got ${JSON.stringify(rateLimit.maxWaitMs)}`)
+  }
+  const pacedModels = requireStringArray(rateLimit.models, 'rateLimit.models')
+  return {
+    enabled: rateLimit.enabled,
+    requestsPerSecond: rateLimit.requestsPerSecond,
+    burst: rateLimit.burst,
+    scope: rateLimit.scope,
+    maxWaitMs: rateLimit.maxWaitMs,
+    pacedPatterns: pacedModels,
+    pacedMatchers: pacedModels.map(compileModelPattern),
   }
 }
 
@@ -276,6 +330,108 @@ function createProxyProbe(options) {
 }
 
 /**
+ * Raised when a request would have to wait past `rateLimit.maxWaitMs`.
+ *
+ * The request is not sent at all: sending it would spend the upstream quota the
+ * limit protects, and falling back to the direct route would spend it even
+ * faster.
+ */
+export class RateLimitExceededError extends Error {
+  /**
+   * @param key - the bucket the request belonged to.
+   * @param waitedMs - how long this request had already waited.
+   * @param maxWaitMs - the configured ceiling.
+   */
+  constructor(key, waitedMs, maxWaitMs) {
+    super(`dsh-model-proxy: rate limit for ${key} would wait past ${maxWaitMs}ms (already waited ${waitedMs}ms); the request was not sent`)
+    this.name = 'RateLimitExceededError'
+    this.key = key
+    this.waitedMs = waitedMs
+    this.maxWaitMs = maxWaitMs
+  }
+}
+
+/**
+ * Build the pacing limiter.
+ *
+ * One token bucket per key, refilled at `requestsPerSecond` with `burst` tokens
+ * of capacity, so a short idle period banks a small burst instead of wasting it.
+ * Acquisitions on one key run in arrival order because each waits on the previous
+ * one's turn; an acquisition that is refused does not stall the ones behind it.
+ * @param options - the resolved `rateLimit` block.
+ * @returns a limiter whose `acquire` resolves with the milliseconds it waited.
+ */
+export function createRateLimiter(options) {
+  const tokensPerMs = options.requestsPerSecond / 1000
+  const buckets = new Map()
+
+  // The timer stays referenced on purpose: a request waiting for its slot is
+  // outstanding work, and letting the event loop drain under it would lose the
+  // call before it was ever dispatched.
+  const sleep = ms => new Promise(resolve => { setTimeout(resolve, ms) })
+
+  /**
+   * Drain one token, waiting for it if the bucket is empty.
+   * @param bucket - this key's bucket.
+   * @param key - the bucket name, for the refusal diagnostic.
+   * @returns the milliseconds this request waited.
+   * @throws {RateLimitExceededError} when the wait would exceed `maxWaitMs`.
+   */
+  async function take(bucket, key) {
+    let waitedMs = 0
+    for (;;) {
+      const now = Date.now()
+      const elapsedMs = now - bucket.updatedAt
+      if (elapsedMs > 0) {
+        bucket.tokens = Math.min(options.burst, bucket.tokens + elapsedMs * tokensPerMs)
+        bucket.updatedAt = now
+      }
+      if (bucket.tokens >= 1) {
+        bucket.tokens -= 1
+        return waitedMs
+      }
+      const waitMs = Math.max(1, Math.ceil((1 - bucket.tokens) / tokensPerMs))
+      if (waitedMs + waitMs > options.maxWaitMs) {
+        throw new RateLimitExceededError(key, waitedMs, options.maxWaitMs)
+      }
+      await sleep(waitMs)
+      waitedMs += waitMs
+    }
+  }
+
+  return {
+    /**
+     * Reserve one slot in `key`'s bucket.
+     * @param key - the bucket name: a model id, or `all` under shared scope.
+     * @returns the milliseconds this request had to wait.
+     */
+    acquire(key) {
+      let bucket = buckets.get(key)
+      if (bucket === undefined) {
+        bucket = { tokens: options.burst, updatedAt: Date.now(), queue: Promise.resolve() }
+        buckets.set(key, bucket)
+      }
+      const turn = bucket.queue.then(() => take(bucket, key))
+      // Keep the chain alive after a refusal so the requests behind it still run.
+      bucket.queue = turn.then(() => undefined, () => undefined)
+      return turn
+    },
+  }
+}
+
+/**
+ * Name the bucket a matched model is paced in.
+ * @param rateLimit - the resolved `rateLimit` block.
+ * @param model - the matched model id.
+ * @returns the bucket key, or undefined when this model is not paced.
+ */
+function pacedKey(rateLimit, model) {
+  if (!rateLimit.enabled) return undefined
+  if (rateLimit.pacedMatchers.length > 0 && !rateLimit.pacedMatchers.some(matches => matches(model))) return undefined
+  return rateLimit.scope === 'shared' ? 'all' : model
+}
+
+/**
  * A dispatcher that routes by model name and forwards everything else.
  *
  * `dispatch` answers synchronously, as undici requires, and completes the route
@@ -292,7 +448,13 @@ function createRoutingDispatcher(options) {
     #closed = false
 
     dispatch(dispatchOptions, handler) {
-      void this.#route(dispatchOptions, handler)
+      // Nothing may escape this promise: `dispatch` answers synchronously and the
+      // caller does not await it, so an escape would surface as an unhandled
+      // rejection and take the whole process down.
+      this.#route(dispatchOptions, handler).catch(error => {
+        options.report(`dispatch failed: ${describeError(error)}`)
+        failDispatch(handler, error)
+      })
       return true
     }
 
@@ -304,6 +466,7 @@ function createRoutingDispatcher(options) {
     async #route(dispatchOptions, handler) {
       let target = options.direct
       let reason = 'origin'
+      let model
       try {
         const host = originHost(dispatchOptions)
         if (host !== undefined && options.config.origins.has(host) && hasRequestBody(dispatchOptions)) {
@@ -314,7 +477,7 @@ function createRoutingDispatcher(options) {
             // The path is checked first because a request that names its model
             // there is routed without its body being held at all; only a request
             // that names none falls back to reading the body's head.
-            let model = modelFromPath(dispatchOptions.path)
+            model = modelFromPath(dispatchOptions.path)
             if (model === undefined) {
               const peeked = await peekModel(dispatchOptions.body, options.config.peekBytes)
               dispatchOptions.body = peeked.body
@@ -333,7 +496,27 @@ function createRoutingDispatcher(options) {
       } catch (error) {
         options.report(`route fell back to direct after ${describeError(error)}`)
       }
-      options.record(target === options.proxied ? 'proxy' : 'direct', reason)
+
+      // Pacing runs after the route is chosen and outside the catch above: a
+      // request the limiter refuses has to fail rather than fall back to the
+      // direct route, which is exactly the traffic the limit exists to hold back.
+      let waitedMs
+      const key = target === options.proxied && model !== undefined ? pacedKey(options.config.rateLimit, model) : undefined
+      if (key !== undefined) {
+        try {
+          waitedMs = await options.rateLimit.acquire(key)
+        } catch (error) {
+          options.report(`refused a request for ${key}: ${describeError(error)}`)
+          failDispatch(handler, error)
+          return
+        }
+      }
+
+      options.record(
+        target === options.proxied ? 'proxy' : 'direct',
+        reason,
+        waitedMs === undefined || waitedMs === 0 ? undefined : `waited=${waitedMs}ms`,
+      )
       target.dispatch(dispatchOptions, handler)
     }
 
@@ -368,6 +551,23 @@ function describeError(error) {
 }
 
 /**
+ * Fail one dispatch that was never handed to a route.
+ *
+ * undici hands a custom dispatcher a `LegacyHandlerWrapper`, which speaks the
+ * newer handler interface (`onResponseError`) instead of the legacy one
+ * (`onError`). Both spellings are accepted here because either interface can
+ * arrive depending on which undici built the caller.
+ * @param handler - the handler from the dispatch options.
+ * @param error - the failure to report to it.
+ * @throws when the handler implements neither spelling.
+ */
+function failDispatch(handler, error) {
+  if (typeof handler?.onResponseError === 'function') handler.onResponseError(undefined, error)
+  else if (typeof handler?.onError === 'function') handler.onError(error)
+  else throw error
+}
+
+/**
  * Install the routing dispatcher for this process.
  *
  * Asynchronous so the undici import resolves before the slot is claimed; the
@@ -391,8 +591,9 @@ export async function apply(ctx, raw) {
     cacheMs: config.probeCacheMs,
   })
   let lastReason
-  const record = (route, reason) => {
-    const line = `dsh-model-proxy: route=${route} via=${route === 'proxy' ? config.proxyUrl : 'direct'} reason=${reason}`
+  const record = (route, reason, note) => {
+    const suffix = note === undefined ? '' : ` ${note}`
+    const line = `dsh-model-proxy: route=${route} via=${route === 'proxy' ? config.proxyUrl : 'direct'} reason=${reason}${suffix}`
     if (route === 'proxy' || reason !== lastReason) ctx.logger.info(line)
     else ctx.logger.debug?.(line)
     lastReason = reason
@@ -403,6 +604,7 @@ export async function apply(ctx, raw) {
     direct,
     proxied,
     proxyIsListening,
+    rateLimit: createRateLimiter(config.rateLimit),
     record,
     report: message => { ctx.logger.warn(`dsh-model-proxy: ${message}`) },
     closeRoutes: () => Promise.allSettled([proxied.close()]).then(() => undefined),
@@ -414,5 +616,16 @@ export async function apply(ctx, raw) {
     if (undici.getGlobalDispatcher() === dispatcher) undici.setGlobalDispatcher(direct)
     return dispatcher.close()
   })
-  ctx.logger.info(`dsh-model-proxy: models ${config.modelPatterns.join(', ')} on ${[...config.origins].join(', ')} via ${config.proxyUrl}${config.fallbackToDirect ? ', direct while it is down' : ''}`)
+  ctx.logger.info(`dsh-model-proxy: models ${config.modelPatterns.join(', ')} on ${[...config.origins].join(', ')} via ${config.proxyUrl}${config.fallbackToDirect ? ', direct while it is down' : ''}${describePacing(config.rateLimit)}`)
+}
+
+/**
+ * Render the pacing summary appended to the activation line.
+ * @param rateLimit - the resolved `rateLimit` block.
+ * @returns the summary, or an empty string when nothing is paced.
+ */
+function describePacing(rateLimit) {
+  if (!rateLimit.enabled) return ''
+  const paced = rateLimit.pacedPatterns.length > 0 ? rateLimit.pacedPatterns.join(', ') : 'every matched model'
+  return `, paced at ${rateLimit.requestsPerSecond}/s (burst ${rateLimit.burst}, ${rateLimit.scope} scope, refusing past ${rateLimit.maxWaitMs}ms) on ${paced}`
 }

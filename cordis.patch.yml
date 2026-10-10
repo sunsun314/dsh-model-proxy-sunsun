@@ -9,6 +9,10 @@
 # (`/v1beta/models/<model>:generateContent`, the native Google shape) and then
 # from its body's `model` field (`/chat/completions`, the OpenAI-compatible
 # shape); every other request in the process keeps the route it already had.
+#
+# `rateLimit` paces what goes through the proxy. Its `models` list is scoped to
+# the Google families on purpose: Google's free tier meters each model separately
+# and will not take a burst, while OpenCode's gateway has no such ceiling.
 - insert:
     - id: model-proxy
       name: 'dsh-model-proxy'
@@ -26,3 +30,11 @@
         probeTimeoutMs: 300
         probeCacheMs: 2000
         peekBytes: 16384
+        rateLimit:
+          enabled: true
+          requestsPerSecond: 1
+          burst: 1
+          scope: model
+          models:
+            - gemini-*
+          maxWaitMs: 120000
